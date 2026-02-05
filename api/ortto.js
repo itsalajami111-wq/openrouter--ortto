@@ -1,42 +1,44 @@
 const DEFAULT_MODEL = "openai/gpt-4o-mini";
+
 const COUNTRY_CODE_FIELD = "str:cm:country-of-residence-code";
 const PROMPT_FIELD = "str:cm:prompt";
 const COUNTRY_NAME_FIELD = "str:cm:country-of-residence";
 const CONTACT_ID_FIELD = "contact_id";
+
 const COUNTRY_CODE_ALIASES = [
   COUNTRY_CODE_FIELD,
   "country_of_residence_code",
   "country_code",
   "country",
 ];
+
 const PROMPT_ALIASES = [PROMPT_FIELD, "prompt"];
-const CONTACT_ID_ALIASES = [CONTACT_ID_FIELD, "contactId", "str:cm:contact-id"];
+
+const CONTACT_ID_ALIASES = [
+  CONTACT_ID_FIELD,
+  "contactId",
+  "str:cm:contact-id",
+];
 
 function parseBody(req) {
-  if (!req.body) {
-    return null;
-  }
+  if (!req.body) return null;
 
   if (Buffer.isBuffer(req.body)) {
     const text = req.body.toString("utf8").trim();
-    if (!text) {
-      return null;
-    }
+    if (!text) return null;
     try {
       return JSON.parse(text);
-    } catch (error) {
+    } catch {
       return null;
     }
   }
 
-  if (typeof req.body === "object") {
-    return req.body;
-  }
+  if (typeof req.body === "object") return req.body;
 
   if (typeof req.body === "string") {
     try {
       return JSON.parse(req.body);
-    } catch (error) {
+    } catch {
       return null;
     }
   }
@@ -45,14 +47,10 @@ function parseBody(req) {
 }
 
 function getFieldValue(payload, fieldName) {
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
+  if (!payload || typeof payload !== "object") return null;
 
   const direct = payload[fieldName];
-  if (direct !== undefined && direct !== null) {
-    return direct;
-  }
+  if (direct !== undefined && direct !== null && direct !== "") return direct;
 
   const nestedSources = [
     payload.fields,
@@ -63,8 +61,9 @@ function getFieldValue(payload, fieldName) {
   ];
 
   for (const source of nestedSources) {
-    if (source && typeof source === "object" && fieldName in source) {
-      return source[fieldName];
+    if (source && typeof source === "object") {
+      const v = source[fieldName];
+      if (v !== undefined && v !== null && v !== "") return v;
     }
   }
 
@@ -72,25 +71,19 @@ function getFieldValue(payload, fieldName) {
 }
 
 function getFieldValueFromList(payload, fieldNames) {
-  for (const fieldName of fieldNames) {
-    const value = getFieldValue(payload, fieldName);
-    if (value !== null && value !== undefined && value !== "") {
-      return value;
-    }
+  for (const name of fieldNames) {
+    const value = getFieldValue(payload, name);
+    if (value !== null && value !== undefined && value !== "") return value;
   }
-
   return null;
 }
 
 function extractFields(payload) {
   if (!payload || typeof payload !== "object") {
-    return { countryCode: null, prompt: null };
     return { countryCode: null, prompt: null, contactId: null };
   }
 
   return {
-    countryCode: payload[COUNTRY_CODE_FIELD] ?? null,
-    prompt: payload[PROMPT_FIELD] ?? null,
     countryCode: getFieldValueFromList(payload, COUNTRY_CODE_ALIASES),
     prompt: getFieldValueFromList(payload, PROMPT_ALIASES),
     contactId: getFieldValueFromList(payload, CONTACT_ID_ALIASES),
@@ -101,13 +94,15 @@ async function updateOrttoContact({ contactId, countryName }) {
   const updateUrl = process.env.ORTTO_UPDATE_URL;
   const apiKey = process.env.ORTTO_API_KEY;
 
+  // Optional: only run if configured
   if (!updateUrl || !apiKey) {
     console.log("Ortto update skipped (missing ORTTO_UPDATE_URL or ORTTO_API_KEY).");
     return { skipped: true };
   }
 
-  console.log("Updating Ortto contact", { contactId, updateUrl });
-  const response = await fetch(updateUrl, {
+  console.log("Updating Ortto contact", { contactId });
+
+  const resp = await fetch(updateUrl, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -119,12 +114,16 @@ async function updateOrttoContact({ contactId, countryName }) {
     }),
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ortto update failed (${response.status}): ${errorText}`);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Ortto update failed (${resp.status}): ${text}`);
   }
 
-  return response.json().catch(() => ({}));
+  try {
+    return await resp.json();
+  } catch {
+    return {};
+  }
 }
 
 module.exports = async function handler(req, res) {
@@ -135,12 +134,11 @@ module.exports = async function handler(req, res) {
     userAgent: req.headers["user-agent"],
   });
 
+  // Connection tests / browser hits
   if (req.method === "GET" || req.method === "HEAD") {
     res.setHeader("Allow", "POST");
-    console.log("Ortto connection test request received");
-    if (req.method === "HEAD") {
-      return res.status(200).end();
-    }
+    console.log("Connection test request received");
+    if (req.method === "HEAD") return res.status(200).end();
     return res.status(200).json({ status: "ok" });
   }
 
@@ -150,63 +148,48 @@ module.exports = async function handler(req, res) {
   }
 
   const payload = parseBody(req);
-  const { countryCode, prompt } = extractFields(payload);
+
   if (!payload) {
-    console.warn("Ortto webhook missing or invalid JSON body", {
-      bodyType: typeof req.body,
-    });
-  }
-
-  if (payload && typeof payload === "object") {
-    console.log("Ortto payload keys", Object.keys(payload));
-  }
-
-  let countryCode = null;
-  let prompt = null;
-  let contactId = null;
-  if (payload) {
-    ({ countryCode, prompt, contactId } = extractFields(payload));
-  }
-  const isEmptyTestRequest = !payload || (!countryCode && !prompt);
-  if (isEmptyTestRequest) {
-    console.log("Ortto test request detected (empty payload). Returning 200.");
+    console.warn("Missing or invalid JSON body", { bodyType: typeof req.body });
+    // Treat as test request so Ortto can connect
     return res.status(200).json({ status: "ok" });
   }
 
-  if (!countryCode || !prompt) {
-  if (!countryCode || !prompt || !contactId) {
-    const missing = [];
-    if (!countryCode) {
-      missing.push(COUNTRY_CODE_FIELD);
-    }
-    if (!prompt) {
-      missing.push(PROMPT_FIELD);
-    }
-    if (!contactId) {
-      missing.push(CONTACT_ID_FIELD);
-    }
+  console.log("Ortto payload keys", Object.keys(payload));
 
-    console.warn("Ortto webhook missing required fields", {
-      missing,
-      countryCodePresent: Boolean(countryCode),
-      promptPresent: Boolean(prompt),
-      contactIdPresent: Boolean(contactId),
-    });
+  const { countryCode, prompt, contactId } = extractFields(payload);
+
+  // If Ortto sends an empty-ish test POST, don’t fail it
+  const isEmptyTestRequest = !countryCode && !prompt && !contactId;
+  if (isEmptyTestRequest) {
+    console.log("Test POST detected (no fields). Returning 200.");
+    return res.status(200).json({ status: "ok" });
+  }
+
+  // Require only the two fields needed for OpenRouter
+  // contactId is useful, but not always present depending on Ortto test payload
+  if (!countryCode || !prompt) {
+    const missing = [];
+    if (!countryCode) missing.push(COUNTRY_CODE_FIELD);
+    if (!prompt) missing.push(PROMPT_FIELD);
+
+    console.warn("Missing required fields", { missing, contactIdPresent: Boolean(contactId) });
+
     return res.status(400).json({
       error: "Missing required fields",
       required: [COUNTRY_CODE_FIELD, PROMPT_FIELD],
-      required: [COUNTRY_CODE_FIELD, PROMPT_FIELD, CONTACT_ID_FIELD],
       missing,
     });
   }
 
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  if (!openrouterKey) {
     return res.status(500).json({ error: "OPENROUTER_API_KEY is not configured" });
   }
 
   const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
   console.log("Calling OpenRouter", { model });
+
   const requestBody = {
     model,
     messages: [
@@ -226,7 +209,7 @@ module.exports = async function handler(req, res) {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${openrouterKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(requestBody),
@@ -234,10 +217,7 @@ module.exports = async function handler(req, res) {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("OpenRouter request failed", {
-        status: response.status,
-        details: errorText,
-      });
+      console.error("OpenRouter request failed", { status: response.status, details: errorText });
       return res.status(502).json({
         error: "OpenRouter request failed",
         status: response.status,
@@ -253,27 +233,25 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: "OpenRouter returned no content" });
     }
 
+    // Optional Ortto API update (only if env vars exist)
     let orttoUpdate = null;
-    try {
-      orttoUpdate = await updateOrttoContact({
-        contactId,
-        countryName: output,
-      });
-    } catch (error) {
-      console.error("Ortto update failed", error);
-      return res.status(502).json({
-        error: "Ortto update failed",
-        details: error instanceof Error ? error.message : String(error),
-      });
+    if (contactId) {
+      try {
+        orttoUpdate = await updateOrttoContact({ contactId, countryName: output });
+      } catch (e) {
+        console.error("Ortto update failed", e);
+        // Don’t block returning the response to Ortto
+        orttoUpdate = { error: e instanceof Error ? e.message : String(e) };
+      }
     }
 
     return res.status(200).json({
       [COUNTRY_NAME_FIELD]: output,
-      contact_id: contactId,
+      contact_id: contactId || null,
       ortto_update: orttoUpdate,
     });
   } catch (error) {
-    console.error("Unexpected error calling OpenRouter", error);
+    console.error("Unexpected error", error);
     return res.status(500).json({
       error: "Unexpected error calling OpenRouter",
       details: error instanceof Error ? error.message : String(error),
