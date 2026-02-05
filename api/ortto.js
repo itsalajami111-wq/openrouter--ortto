@@ -1,16 +1,33 @@
 const DEFAULT_MODEL = "openai/gpt-4o-mini";
+const COUNTRY_CODE_FIELD = "str:cm:country-of-residence-code";
+const PROMPT_FIELD = "str:cm:prompt";
 const COUNTRY_NAME_FIELD = "str:cm:country-of-residence";
 
-// Parse JSON or URL-encoded body
 function parseBody(req) {
+  if (!req.body) {
+    return null;
+  }
+
+  if (typeof req.body === "object") {
+    return req.body;
+  }
   if (!req.body) return null;
   if (typeof req.body === "object") return req.body;
 
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body);
+    } catch (error) {
+      return null;
+    }
+  }
   const text = Buffer.isBuffer(req.body)
     ? req.body.toString("utf8")
     : String(req.body);
 
-  try { return JSON.parse(text); } catch {}
+  try {
+    return JSON.parse(text);
+  } catch {}
   try {
     const params = new URLSearchParams(text);
     const obj = {};
@@ -20,6 +37,9 @@ function parseBody(req) {
   return null;
 }
 
+function extractFields(payload) {
+  if (!payload || typeof payload !== "object") {
+    return { countryCode: null, prompt: null };
 function getFieldValue(payload, key) {
   if (!payload) return null;
   if (payload[key]) return payload[key];
@@ -31,7 +51,10 @@ function getFieldValue(payload, key) {
   return null;
 }
 
-// Calls OpenRouter to get the country name from code
+  return {
+    countryCode: payload[COUNTRY_CODE_FIELD] ?? null,
+    prompt: payload[PROMPT_FIELD] ?? null,
+  };
 async function generateCountryName(countryCode) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not configured");
@@ -70,6 +93,7 @@ module.exports = async function handler(req, res) {
   }
 
   const payload = parseBody(req);
+  const { countryCode, prompt } = extractFields(payload);
   console.log("Parsed payload:", payload);
 
   const contactId = getFieldValue(payload, "contact_id");
@@ -77,28 +101,45 @@ module.exports = async function handler(req, res) {
     getFieldValue(payload, "country_of_residence_code") ||
     getFieldValue(payload, "str:cm:country-of-residence-code");
 
+  if (!countryCode || !prompt) {
   if (!contactId || !countryCode) {
     return res.status(400).json({
+      error: "Missing required fields",
+      required: [COUNTRY_CODE_FIELD, PROMPT_FIELD],
       error: "Missing contact_id or country_of_residence_code",
     });
   }
 
-  // Get the country name from OpenRouter
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: "OPENROUTER_API_KEY is not configured" });
   let countryName;
   try {
     countryName = await generateCountryName(countryCode);
-  } catch (err) {
-    console.error("OpenRouter generation failed:", err);
+  } catch (error) {
+    console.error("OpenRouter generation failed:", error);
     return res.status(500).json({ error: "OpenRouter failure" });
   }
 
-  // Extract an email if the webhook provided one
+  const model = process.env.OPENROUTER_MODEL || DEFAULT_MODEL;
+  const requestBody = {
+    model,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You receive a country code and a prompt. Use the prompt instructions and interpret the country code as needed. Return only the final country name.",
+      },
+      {
+        role: "user",
+        content: `Prompt: ${prompt}\nCountry code: ${countryCode}`,
+      },
+    ],
   const contactEmail =
     getFieldValue(payload, "email") ||
     getFieldValue(payload, "str:cm:email-secondary") ||
     getFieldValue(payload, "str::email");
 
-  // Build the Ortto merge request
   const mergeUrl = "https://api.eu.ap3api.com/v1/person/merge";
   const mergePerson = {
     person_id: contactId,
@@ -107,11 +148,10 @@ module.exports = async function handler(req, res) {
     },
   };
 
-  // Only include email if it exists
   if (contactEmail) {
-  mergePerson.fields["str::email"] = contactEmail;
-  mergePerson.fields["str:cm:email-secondary"] = contactEmail;
-}
+    mergePerson.fields["str::email"] = contactEmail;
+    mergePerson.fields["str:cm:email-secondary"] = contactEmail;
+  }
 
   const mergeBody = {
     merge_by: "person_id",
@@ -120,15 +160,25 @@ module.exports = async function handler(req, res) {
 
   let orttoResult;
   try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     const resp = await fetch(mergeUrl, {
       method: "POST",
       headers: {
+        Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
         "X-Api-Key": process.env.ORTTO_API_KEY,
       },
+      body: JSON.stringify(requestBody),
       body: JSON.stringify(mergeBody),
     });
 
+    if (!response.ok) {
+      const errorText = await response.text();
+      return res.status(502).json({
+        error: "OpenRouter request failed",
+        status: response.status,
+        details: errorText,
+      });
     const text = await resp.text();
     if (!resp.ok) {
       console.error("Ortto merge failed", resp.status, text);
@@ -137,9 +187,24 @@ module.exports = async function handler(req, res) {
       console.log("Ortto merge success", text);
       orttoResult = { ok: true, status: resp.status, body: text };
     }
-  } catch (err) {
-    console.error("Ortto merge exception:", err);
-    orttoResult = { ok: false, exception: err.toString() };
+
+    const data = await response.json();
+    const output = data?.choices?.[0]?.message?.content?.trim();
+
+    if (!output) {
+      return res.status(502).json({ error: "OpenRouter returned no content" });
+    }
+
+    return res.status(200).json({
+      [COUNTRY_NAME_FIELD]: output,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Unexpected error calling OpenRouter",
+      details: error instanceof Error ? error.message : String(error),
+    });
+    console.error("Ortto merge exception:", error);
+    orttoResult = { ok: false, exception: error.toString() };
   }
 
   return res.status(200).json({
