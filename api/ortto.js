@@ -114,9 +114,10 @@ if (contactEmail) {
 }
 
 const mergeBody = {
-  merge_by: ["person_id"],  // 👈 corrected: must be array
+  merge_by: ["str::email"],  // 👈 use email field as merge key
   people: [mergePerson],
 };
+
 
 let orttoResult;
 try {
