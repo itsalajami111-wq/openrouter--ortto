@@ -109,8 +109,9 @@ module.exports = async function handler(req, res) {
 
   // Only include email if it exists
   if (contactEmail) {
-    mergePerson.fields.email = contactEmail;
-  }
+  mergePerson.fields["str::email"] = contactEmail;
+  mergePerson.fields["str:cm:email-secondary"] = contactEmail;
+}
 
   const mergeBody = {
     merge_by: "person_id",
