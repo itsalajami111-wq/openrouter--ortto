@@ -2,6 +2,15 @@ const DEFAULT_MODEL = "openai/gpt-4o-mini";
 const COUNTRY_CODE_FIELD = "str:cm:country-of-residence-code";
 const PROMPT_FIELD = "str:cm:prompt";
 const COUNTRY_NAME_FIELD = "str:cm:country-of-residence";
+const CONTACT_ID_FIELD = "contact_id";
+const COUNTRY_CODE_ALIASES = [
+  COUNTRY_CODE_FIELD,
+  "country_of_residence_code",
+  "country_code",
+  "country",
+];
+const PROMPT_ALIASES = [PROMPT_FIELD, "prompt"];
+const CONTACT_ID_ALIASES = [CONTACT_ID_FIELD, "contactId", "str:cm:contact-id"];
 
 function parseBody(req) {
   if (!req.body) {
@@ -62,17 +71,60 @@ function getFieldValue(payload, fieldName) {
   return null;
 }
 
+function getFieldValueFromList(payload, fieldNames) {
+  for (const fieldName of fieldNames) {
+    const value = getFieldValue(payload, fieldName);
+    if (value !== null && value !== undefined && value !== "") {
+      return value;
+    }
+  }
+
+  return null;
+}
+
 function extractFields(payload) {
   if (!payload || typeof payload !== "object") {
     return { countryCode: null, prompt: null };
+    return { countryCode: null, prompt: null, contactId: null };
   }
 
   return {
     countryCode: payload[COUNTRY_CODE_FIELD] ?? null,
     prompt: payload[PROMPT_FIELD] ?? null,
-    countryCode: getFieldValue(payload, COUNTRY_CODE_FIELD),
-    prompt: getFieldValue(payload, PROMPT_FIELD),
+    countryCode: getFieldValueFromList(payload, COUNTRY_CODE_ALIASES),
+    prompt: getFieldValueFromList(payload, PROMPT_ALIASES),
+    contactId: getFieldValueFromList(payload, CONTACT_ID_ALIASES),
   };
+}
+
+async function updateOrttoContact({ contactId, countryName }) {
+  const updateUrl = process.env.ORTTO_UPDATE_URL;
+  const apiKey = process.env.ORTTO_API_KEY;
+
+  if (!updateUrl || !apiKey) {
+    console.log("Ortto update skipped (missing ORTTO_UPDATE_URL or ORTTO_API_KEY).");
+    return { skipped: true };
+  }
+
+  console.log("Updating Ortto contact", { contactId, updateUrl });
+  const response = await fetch(updateUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contact_id: contactId,
+      [COUNTRY_NAME_FIELD]: countryName,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Ortto update failed (${response.status}): ${errorText}`);
+  }
+
+  return response.json().catch(() => ({}));
 }
 
 module.exports = async function handler(req, res) {
@@ -98,6 +150,7 @@ module.exports = async function handler(req, res) {
   }
 
   const payload = parseBody(req);
+  const { countryCode, prompt } = extractFields(payload);
   if (!payload) {
     console.warn("Ortto webhook missing or invalid JSON body", {
       bodyType: typeof req.body,
@@ -108,7 +161,7 @@ module.exports = async function handler(req, res) {
     console.log("Ortto payload keys", Object.keys(payload));
   }
 
-  const { countryCode, prompt } = extractFields(payload);
+  const { countryCode, prompt, contactId } = extractFields(payload);
   const isEmptyTestRequest = !payload || (!countryCode && !prompt);
   if (isEmptyTestRequest) {
     console.log("Ortto test request detected (empty payload). Returning 200.");
@@ -116,6 +169,7 @@ module.exports = async function handler(req, res) {
   }
 
   if (!countryCode || !prompt) {
+  if (!countryCode || !prompt || !contactId) {
     const missing = [];
     if (!countryCode) {
       missing.push(COUNTRY_CODE_FIELD);
@@ -123,15 +177,20 @@ module.exports = async function handler(req, res) {
     if (!prompt) {
       missing.push(PROMPT_FIELD);
     }
+    if (!contactId) {
+      missing.push(CONTACT_ID_FIELD);
+    }
 
     console.warn("Ortto webhook missing required fields", {
       missing,
       countryCodePresent: Boolean(countryCode),
       promptPresent: Boolean(prompt),
+      contactIdPresent: Boolean(contactId),
     });
     return res.status(400).json({
       error: "Missing required fields",
       required: [COUNTRY_CODE_FIELD, PROMPT_FIELD],
+      required: [COUNTRY_CODE_FIELD, PROMPT_FIELD, CONTACT_ID_FIELD],
       missing,
     });
   }
@@ -189,8 +248,24 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({ error: "OpenRouter returned no content" });
     }
 
+    let orttoUpdate = null;
+    try {
+      orttoUpdate = await updateOrttoContact({
+        contactId,
+        countryName: output,
+      });
+    } catch (error) {
+      console.error("Ortto update failed", error);
+      return res.status(502).json({
+        error: "Ortto update failed",
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     return res.status(200).json({
       [COUNTRY_NAME_FIELD]: output,
+      contact_id: contactId,
+      ortto_update: orttoUpdate,
     });
   } catch (error) {
     console.error("Unexpected error calling OpenRouter", error);
