@@ -98,49 +98,50 @@ module.exports = async function handler(req, res) {
     getFieldValue(payload, "str:cm:email-secondary") ||
     getFieldValue(payload, "str::email");
 
-  // Build the Ortto merge request
-  const mergeUrl = "https://api.eu.ap3api.com/v1/person/merge";
-  const mergePerson = {
-    person_id: contactId,
-    fields: {
-      [COUNTRY_NAME_FIELD]: countryName,
+const mergeUrl = "https://api.eu.ap3api.com/v1/person/merge";
+
+const mergePerson = {
+  person_id: contactId,
+  fields: {
+    [COUNTRY_NAME_FIELD]: countryName,
+  },
+};
+
+// Include both possible email fields
+if (contactEmail) {
+  mergePerson.fields["str::email"] = contactEmail;
+  mergePerson.fields["str:cm:email-secondary"] = contactEmail;
+}
+
+const mergeBody = {
+  merge_by: ["person_id"],  // 👈 corrected: must be array
+  people: [mergePerson],
+};
+
+let orttoResult;
+try {
+  const resp = await fetch(mergeUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": process.env.ORTTO_API_KEY,
     },
-  };
+    body: JSON.stringify(mergeBody),
+  });
 
-  // Include both possible email field names for Ortto
-  if (contactEmail) {
-    mergePerson.fields["str::email"] = contactEmail;
-    mergePerson.fields["str:cm:email-secondary"] = contactEmail;
+  const text = await resp.text();
+  if (!resp.ok) {
+    console.error("Ortto merge failed", resp.status, text);
+    orttoResult = { ok: false, status: resp.status, body: text };
+  } else {
+    console.log("Ortto merge success", text);
+    orttoResult = { ok: true, status: resp.status, body: text };
   }
+} catch (err) {
+  console.error("Ortto merge exception:", err);
+  orttoResult = { ok: false, exception: err.toString() };
+}
 
-  const mergeBody = {
-    merge_by: "person_id",
-    people: [mergePerson],
-  };
-
-  let orttoResult;
-  try {
-    const resp = await fetch(mergeUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Api-Key": process.env.ORTTO_API_KEY,
-      },
-      body: JSON.stringify(mergeBody),
-    });
-
-    const text = await resp.text();
-    if (!resp.ok) {
-      console.error("Ortto merge failed", resp.status, text);
-      orttoResult = { ok: false, status: resp.status, body: text };
-    } else {
-      console.log("Ortto merge success", text);
-      orttoResult = { ok: true, status: resp.status, body: text };
-    }
-  } catch (err) {
-    console.error("Ortto merge exception:", err);
-    orttoResult = { ok: false, exception: err.toString() };
-  }
 
   return res.status(200).json({
     contact_id: contactId,
