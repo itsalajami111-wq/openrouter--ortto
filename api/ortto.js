@@ -161,7 +161,12 @@ module.exports = async function handler(req, res) {
     console.log("Ortto payload keys", Object.keys(payload));
   }
 
-  const { countryCode, prompt, contactId } = extractFields(payload);
+  let countryCode = null;
+  let prompt = null;
+  let contactId = null;
+  if (payload) {
+    ({ countryCode, prompt, contactId } = extractFields(payload));
+  }
   const isEmptyTestRequest = !payload || (!countryCode && !prompt);
   if (isEmptyTestRequest) {
     console.log("Ortto test request detected (empty payload). Returning 200.");
